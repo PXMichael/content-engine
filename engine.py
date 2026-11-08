@@ -328,21 +328,25 @@ def score_moments(
 # ---------------------------------------------------------------------------
 
 def _first_sentence(text: str) -> str:
-    for sep in [". ", "? ", "! "]:
-        idx = text.find(sep)
-        if idx > 0:
-            return text[: idx + 1].strip()
+    """First complete sentence with at least 4 words."""
+    for m in re.finditer(r"[^.!?]+[.!?]", text):
+        s = m.group(0).strip()
+        if len(s.split()) >= 4:
+            return s
     return text[:140].strip()
 
 
-def _key_fact(text: str) -> str:
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+def _key_fact(text: str, hook: str) -> str:
+    """A sentence with a number or name, different from the hook, max 160 chars."""
     best = ""
-    for s in sentences:
-        if _NUMBER_RE.search(s) or _NAME_RE.search(s):
+    for s in re.split(r"(?<=[.!?])\s+", text):
+        s = s.strip()
+        if not s or s == hook:
+            continue
+        if (_NUMBER_RE.search(s) or _NAME_RE.search(s)) and len(s) <= 160:
             if len(s) > len(best):
-                best = s.strip()
-    return best[:200] if best else text[:140].strip()
+                best = s
+    return best if best else text[:140].strip()
 
 
 def write_copy(
@@ -354,7 +358,7 @@ def write_copy(
     """Deterministic first-draft social copy per platform."""
     platforms = platforms or ["x", "facebook", "shorts", "tiktok"]
     hook = _first_sentence(clip_text)
-    fact = _key_fact(clip_text)
+    fact = _key_fact(clip_text, hook)
     out: Dict[str, str] = {}
     for p in platforms:
         p = p.lower()
