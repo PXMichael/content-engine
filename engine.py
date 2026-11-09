@@ -1,9 +1,9 @@
 """Content Engine core.
 
 Fetch a YouTube transcript, score clip moments, write per-platform social
-copy, and cut clips with ffmpeg. No API keys, no model tokens. Uses yt-dlp
-for transcript download and ffmpeg for cutting, both discovered on PATH or
-in the standard Hermes locations.
+copy, and cut clips with ffmpeg. No API keys, no model tokens. yt-dlp and
+ffmpeg are found on PATH with shutil.which. Every URL is restricted to
+YouTube hosts and every output path is confined to the plugin work dir.
 """
 
 from __future__ import annotations
@@ -11,60 +11,127 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
-# Tool discovery
+# Tool discovery and safety boundaries
 # ---------------------------------------------------------------------------
 
-_YT_DLP_CANDIDATES = [
-    "yt-dlp",
-    "C:/Users/micha/AppData/Local/hermes/hermes-agent/venv/Scripts/yt-dlp.exe",
-    "C:/Users/micha/.local/bin/yt-dlp",
-]
 
-_FFMPEG_CANDIDATES = [
-    "ffmpeg",
-    "C:/Users/micha/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-8.1-full_build/bin/ffmpeg.exe",
-]
-
-
-def _find_tool(candidates: List[str]) -> Optional[str]:
-    for cand in candidates:
-        if not cand:
-            continue
-        try:
-            subprocess.run(
-                [cand, "-version"] if "ffmpeg" in cand else [cand, "--version"],
-                capture_output=True, timeout=15,
-            )
-            return cand
-        except Exception:
-            continue
-    return None
+def _find_tool(name: str) -> str:
+    """Locate a helper binary on PATH. No machine-specific absolute paths."""
+    path = shutil.which(name)
+    if not path:
+        raise RuntimeError(
+            f"{name} was not found. Install {name} and make sure it is on PATH."
+        )
+    return path
 
 
 def _ytdlp() -> str:
-    path = _find_tool(_YT_DLP_CANDIDATES)
-    if not path:
-        raise RuntimeError(
-            "yt-dlp was not found. Install yt-dlp and put it on PATH, or place it "
-            "at the Hermes venv Scripts directory."
-        )
-    return path
+    return _find_tool("yt-dlp")
 
 
 def _ffmpeg() -> str:
-    path = _find_tool(_FFMPEG_CANDIDATES)
-    if not path:
-        raise RuntimeError(
-            "ffmpeg was not found. Install ffmpeg and put it on PATH, or place it "
-            "at the standard WinGet package location."
+    return _find_tool("ffmpeg")
+
+
+_ALLOWED_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def validate_video_url(url: str) -> str:
+    """Return a normalized YouTube URL, or raise ValueError.
+
+    Only https URLs on YouTube's own hosts are accepted. A leading '-' is
+    rejected so the value can never be parsed as a yt-dlp option, and any
+    userinfo or port is rejected so the authority cannot be redirected.
+    """
+    if not isinstance(url, str):
+        raise ValueError("url must be a string")
+    u = url.strip()
+    if not u or u.startswith("-"):
+        raise ValueError("invalid url: must not be empty or start with '-'")
+    p = urlparse(u)
+    if p.scheme != "https":
+        raise ValueError("invalid url: https is required")
+    host = (p.hostname or "").lower()
+    if host not in _ALLOWED_HOSTS:
+        raise ValueError(f"invalid url: {host!r} is not a YouTube host")
+    if p.username or p.password or p.port:
+        raise ValueError("invalid url: unexpected credentials or port")
+    return u
+
+
+def _hermes_home() -> Path:
+    try:
+        import hermes_constants
+        return Path(hermes_constants.get_hermes_home())
+    except Exception:
+        pass
+    env = os.environ.get("HERMES_HOME")
+    if env:
+        return Path(env)
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        return Path(local) / "hermes"
+    return Path.home() / ".hermes"
+
+
+def _plugin_work_dir() -> Path:
+    base = (_hermes_home() / "plugin-data" / "content-engine").resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _resolve_out_dir(out_dir: Optional[str]) -> str:
+    """Confine every output path to the plugin work dir.
+
+    Absolute paths are allowed only when they already resolve inside the work
+    dir. Traversal ('..') and outside-absolute paths are rejected, so a label
+    or out_dir can never write .srt/.mp4 files elsewhere on the machine.
+    """
+    base = _plugin_work_dir()
+    if not out_dir:
+        return str(Path(tempfile.mkdtemp(prefix="content-engine-", dir=str(base))))
+    requested = Path(str(out_dir))
+    if not requested.is_absolute():
+        requested = base / requested
+    resolved = requested.resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        raise ValueError(
+            "out_dir must resolve inside the plugin work dir: " + str(base)
         )
-    return path
+    resolved.mkdir(parents=True, exist_ok=True)
+    return str(resolved)
+
+
+def _safe_label(label: Any) -> str:
+    """Limit a clip label to [A-Za-z0-9_-] so it cannot escape or inject."""
+    s = str(label or "clip")
+    if not _SAFE_NAME_RE.fullmatch(s):
+        raise ValueError(
+            "label must contain only letters, digits, '_' or '-' (got " + repr(s) + ")"
+        )
+    return s
+
+
+def _escape_filter_path(path: str) -> str:
+    """Escape a filename for an ffmpeg filter argument."""
+    out = []
+    for ch in path:
+        if ch in ("\\", ":", "'", "[", "]", ",", ";"):
+            out.append("\\")
+        out.append(ch)
+    return "".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -79,10 +146,20 @@ def video_id(url: str) -> str:
     return m.group(1) if m else url.strip()
 
 
+def _strip_vtt(s: str) -> str:
+    s = re.sub(r"<[^>]+>", "", s)
+    return (s.replace("&amp;", "&").replace("&lt;", "<")
+             .replace("&gt;", ">").replace("&nbsp;", " ")).strip()
+
+
 def _parse_vtt(path: str) -> List[Dict[str, Any]]:
+    """Parse YouTube VTT, handling both plain captions and auto-caption
+    rolling cues (which repeat the previous line plus new karaoke-tagged words).
+    """
     with open(path, encoding="utf-8") as f:
         content = f.read()
     segments: List[Dict[str, Any]] = []
+    prev_text = ""
     for block in re.split(r"\n\s*\n", content):
         lines = block.strip().split("\n")
         if len(lines) < 2:
@@ -103,11 +180,22 @@ def _parse_vtt(path: str) -> List[Dict[str, Any]]:
         h1, m1, s1, h2, m2, s2 = m.groups()
         start = int(h1) * 3600 + int(m1) * 60 + float(s1)
         end = int(h2) * 3600 + int(m2) * 60 + float(s2)
-        text = " ".join(lines[timing_idx + 1:]).strip()
-        text = re.sub(r"<[^>]+>", "", text)
-        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        if text:
-            segments.append({"start": round(start, 2), "duration": round(end - start, 2), "text": text})
+        dur = end - start
+        text_lines = lines[timing_idx + 1:]
+        raw = "\n".join(text_lines)
+        # Auto-caption rolling cues carry word-level karaoke tags. The last
+        # line holds the NEW spoken words; earlier lines are the previous
+        # rolling line repeated. Plain captions join all lines.
+        if re.search(r"<c>|<\d\d:\d\d:", raw):
+            text = _strip_vtt(text_lines[-1]) if text_lines else ""
+        else:
+            text = " ".join(_strip_vtt(l) for l in text_lines if _strip_vtt(l))
+        text = text.strip()
+        # Skip 10ms "clear" cues and exact consecutive repeats.
+        if not text or dur < 0.12 or text == prev_text:
+            continue
+        segments.append({"start": round(start, 2), "duration": round(dur, 2), "text": text})
+        prev_text = text
     return segments
 
 
@@ -118,13 +206,14 @@ def fetch_transcript(url: str, out_dir: Optional[str] = None) -> Dict[str, Any]:
     transcript_txt, segments}.
     """
     yt = _ytdlp()
-    out_dir = out_dir or tempfile.mkdtemp(prefix="content-engine-")
+    url = validate_video_url(url)
+    out_dir = _resolve_out_dir(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     vid = video_id(url)
 
     meta = subprocess.run(
         [yt, "--skip-download", "--print", "%(title)s", "--print", "%(channel)s",
-         "--print", "%(duration_string)s", url],
+         "--print", "%(duration_string)s", "--", url],
         capture_output=True, text=True, timeout=120,
     )
     if meta.returncode != 0:
@@ -136,7 +225,7 @@ def fetch_transcript(url: str, out_dir: Optional[str] = None) -> Dict[str, Any]:
 
     sub = subprocess.run(
         [yt, "--skip-download", "--write-subs", "--write-auto-subs", "--sub-lang", "en",
-         "--sub-format", "vtt", "-o", os.path.join(out_dir, "transcript"), url],
+         "--sub-format", "vtt", "-o", os.path.join(out_dir, "transcript"), "--", url],
         capture_output=True, text=True, timeout=300,
     )
     vtt_files = sorted(f for f in os.listdir(out_dir) if f.endswith(".vtt"))
@@ -327,26 +416,33 @@ def score_moments(
 # Copy
 # ---------------------------------------------------------------------------
 
+def _excerpt(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text.rstrip(".,;:")
+    return text[:limit].rsplit(" ", 1)[0].rstrip(".,;:")
+
+
 def _first_sentence(text: str) -> str:
-    """First complete sentence with at least 4 words."""
+    """First complete sentence with at least 4 words, capped."""
     for m in re.finditer(r"[^.!?]+[.!?]", text):
         s = m.group(0).strip()
         if len(s.split()) >= 4:
-            return s
-    return text[:140].strip()
+            return _excerpt(s, 120)
+    return _excerpt(text, 120)
 
 
 def _key_fact(text: str, hook: str) -> str:
-    """A sentence with a number or name, different from the hook, max 160 chars."""
+    """A sentence with a number or name that is meaningfully different from the hook."""
     best = ""
     for s in re.split(r"(?<=[.!?])\s+", text):
-        s = s.strip()
+        s = " ".join(s.split())
         if not s or s == hook:
             continue
         if (_NUMBER_RE.search(s) or _NAME_RE.search(s)) and len(s) <= 160:
             if len(s) > len(best):
                 best = s
-    return best if best else text[:140].strip()
+    return _excerpt(best, 120) if best else ""
 
 
 def write_copy(
@@ -359,21 +455,26 @@ def write_copy(
     platforms = platforms or ["x", "facebook", "shorts", "tiktok"]
     hook = _first_sentence(clip_text)
     fact = _key_fact(clip_text, hook)
+    # Auto-caption text has no sentence breaks, so hook and fact can overlap.
+    # Never ship the same words twice.
+    if fact and (fact in hook or hook in fact or fact[:30] in hook):
+        fact = ""
+    body = f"{hook} {fact}".strip() if fact else hook
     out: Dict[str, str] = {}
     for p in platforms:
         p = p.lower()
         if p == "x":
-            out[p] = f"{hook} {fact} {url}".strip()
+            out[p] = f"{body} {url}".strip()
         elif p == "facebook":
-            out[p] = f"{hook}\n\n{fact}\n\n{url}".strip()
+            out[p] = f"{body}\n\n{url}".strip()
         elif p in ("shorts", "youtube_shorts", "youtube"):
-            out[p] = f"{hook} {fact}".strip()
+            out[p] = body
         elif p == "tiktok":
-            out[p] = f"{hook} {fact} Link in bio.".strip()
+            out[p] = f"{body} Link in bio."
         elif p == "instagram":
-            out[p] = f"{hook} {fact} Link in bio.".strip()
+            out[p] = f"{body} Link in bio."
         else:
-            out[p] = f"{hook} {fact} {url}".strip()
+            out[p] = f"{body} {url}".strip()
     return out
 
 
@@ -425,12 +526,14 @@ def cut_clips(
 ) -> List[Dict[str, Any]]:
     """Cut clips from a source video with ffmpeg, burning subtitles."""
     ffmpeg = _ffmpeg()
-    out_dir = out_dir or os.path.dirname(os.path.abspath(video_path)) or "."
+    out_dir = _resolve_out_dir(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     results: List[Dict[str, Any]] = []
     for c in clips:
-        label = c.get("label") or f"clip_{int(c.get('start', 0))}"
+        label = _safe_label(c.get("label") or f"clip_{int(c.get('start', 0))}")
         orient = c.get("orientation", "h")
+        if orient not in ("h", "v"):
+            raise ValueError("orientation must be 'h' or 'v'")
         start = float(c["start"])
         end = float(c["end"])
         dur = end - start
@@ -443,16 +546,17 @@ def cut_clips(
             base_vf = "crop=ih*9/16:ih,scale=1080:1920"
         else:
             base_vf = "scale=1920:1080"
+        sub_arg = _escape_filter_path(os.path.basename(srt))
         if subs and segments and os.path.exists(srt) and os.path.getsize(srt) > 0:
             if orient == "v":
                 vf = (
-                    f"subtitles={os.path.basename(srt)}:force_style='FontSize=20,"
+                    f"subtitles={sub_arg}:force_style='FontSize=20,"
                     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=1',"
                     "crop=ih*9/16:ih,scale=1080:1920"
                 )
             else:
                 vf = (
-                    f"subtitles={os.path.basename(srt)}:force_style='FontSize=22,"
+                    f"subtitles={sub_arg}:force_style='FontSize=22,"
                     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Shadow=1',"
                     "scale=1920:1080"
                 )

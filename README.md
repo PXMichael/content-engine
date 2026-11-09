@@ -36,10 +36,12 @@ hermes plugins install content-engine
 
 ## Setup
 
-Content Engine uses two external tools, both free and both already present in a standard Hermes install:
+Content Engine uses two external tools, both free:
 
-- **yt-dlp** — downloads the transcript. Found on PATH, or at `C:/Users/<you>/AppData/Local/hermes/hermes-agent/venv/Scripts/yt-dlp.exe`.
-- **ffmpeg** — cuts the clips. Found on PATH, or at the standard WinGet package location.
+- **yt-dlp** downloads the transcript.
+- **ffmpeg** cuts the clips.
+
+Both are found on PATH with `shutil.which`. No absolute binary paths are baked in. Install them and make sure they are on PATH.
 
 No API keys. No model tokens. No account.
 
@@ -71,9 +73,10 @@ Then call `ce_cut_clips` with the source path, the clip list, and the transcript
 ## Security notes
 
 - The plugin reads no secrets and no `.env` files. It needs no credentials.
-- It calls yt-dlp and ffmpeg through subprocess, only on the commands you approve.
-- It makes network calls only to YouTube through yt-dlp.
-- It stores transcripts and clips in a working directory you choose, or a temp directory by default.
+- It calls yt-dlp and ffmpeg through list-form subprocess calls with no shell. There is no approval step. The agent or user decides when to call a tool; the tool itself does not ask again.
+- Every URL is restricted to `https://` on `youtube.com`, `www.youtube.com`, `m.youtube.com`, or `youtu.be` before yt-dlp sees it. Values starting with `-` are rejected so they cannot become yt-dlp options, and `--` is passed before the URL in both calls.
+- Every output path is confined to `get_hermes_home()/plugin-data/content-engine/`. An absolute or `../` `out_dir` is rejected, and clip labels are limited to `[A-Za-z0-9_-]`.
+- It makes network calls only to YouTube, through yt-dlp.
 - The copy tool writes a first draft. It does not post anywhere. You review and post.
 
 ## Development

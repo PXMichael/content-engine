@@ -82,3 +82,65 @@ def test_run_handler_requires_url():
     mod = _load_tools()
     out = json.loads(mod._handle_run({}))
     assert "error" in out
+
+
+def test_url_validation_accepts_youtube_hosts():
+    eng = _load_engine()
+    for u in (
+        "https://youtu.be/q-OfppGbeXY",
+        "https://www.youtube.com/watch?v=aircAruvnKk",
+        "https://youtube.com/watch?v=aircAruvnKk",
+        "https://m.youtube.com/watch?v=aircAruvnKk",
+    ):
+        assert eng.validate_video_url(u) == u
+
+
+def test_url_validation_rejects_option_injection_and_other_hosts():
+    eng = _load_engine()
+    bad = [
+        "--exec=whoami",
+        "-https://youtu.be/abc",
+        "https://youtu.be.evil.example/abc",
+        "http://youtu.be/abc",
+        "169.254.169.254/latest/meta-data",
+        "https://169.254.169.254/",
+        "https://youtube.com:8080@evil.example/",
+        "https://user:pass@youtu.be/abc",
+    ]
+    for u in bad:
+        try:
+            eng.validate_video_url(u)
+            raise AssertionError(f"should have rejected: {u}")
+        except ValueError:
+            pass
+
+
+def test_out_dir_confined_to_plugin_work_dir():
+    eng = _load_engine()
+    base = eng._plugin_work_dir()
+    ok = eng._resolve_out_dir("demo-run")
+    assert str(base).replace("\\", "/") in ok.replace("\\", "/")
+    for bad in ("../../escape", "/etc", "C:/Windows/Temp"):
+        try:
+            eng._resolve_out_dir(bad)
+            raise AssertionError(f"should have rejected out_dir: {bad}")
+        except ValueError:
+            pass
+
+
+def test_label_and_filter_escaping():
+    eng = _load_engine()
+    assert eng._safe_label("clip_C03") == "clip_C03"
+    for bad in ("../evil", "a/b", "clip;something", "with space"):
+        try:
+            eng._safe_label(bad)
+            raise AssertionError(f"should have rejected label: {bad}")
+        except ValueError:
+            pass
+    assert eng._escape_filter_path("a'b:c") == "a\\'b\\:c"
+
+
+def test_no_hardcoded_personal_paths():
+    src = (PLUGIN_DIR / "engine.py").read_text(encoding="utf-8")
+    assert "C:/Users/" not in src
+    assert "shutil.which" in src
