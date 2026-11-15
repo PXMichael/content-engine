@@ -281,46 +281,64 @@ _NUMBER_RE = re.compile(r"\b\d[\d,.]*\b")
 _NAME_RE = re.compile(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})+\b")
 
 
-def _make_candidates(segments: List[Dict[str, Any]], lo: float, hi: float, stride: float) -> List[Dict[str, Any]]:
-    """Segment-aligned candidate windows, ported from ClipBot 5000."""
-    cands: List[Dict[str, Any]] = []
+def _candidate_starts(segments: List[Dict[str, Any]], stride: float) -> List[int]:
+    """Segment start indices to consider, one per stride step."""
+    starts: List[int] = []
     i = 0
     n = len(segments)
     while i < n:
-        start = segments[i]["start"]
-        j = i
-        while j < n and (segments[j]["start"] + segments[j]["duration"] - start) < lo:
-            j += 1
-        best_j = None
-        while j < n and (segments[j]["start"] + segments[j]["duration"] - start) <= hi:
-            best_j = j
-            j += 1
-        if best_j is not None:
-            end = segments[best_j]["start"] + segments[best_j]["duration"]
-            text = " ".join(s["text"] for s in segments[i:best_j + 1])
-            cands.append({
-                "start": round(start, 2),
-                "end": round(end, 2),
-                "duration": round(end - start, 2),
-                "text": text,
-                "first": segments[i]["text"].strip(),
-                "last": segments[best_j]["text"].strip(),
-            })
-        target = start + stride
-        while i < n and segments[i]["start"] < target:
+        starts.append(i)
+        edge = segments[i]["start"] + stride
+        while i < n and segments[i]["start"] < edge:
             i += 1
         if i >= n:
             break
+    return starts
+
+
+def _window_end(segments: List[Dict[str, Any]], i: int, lo: float, hi: float,
+                target: float) -> Optional[int]:
+    """End index whose segment-aligned window is closest to `target` within [lo, hi]."""
+    n = len(segments)
+    start = segments[i]["start"]
+    j = i
+    while j < n and (segments[j]["start"] + segments[j]["duration"] - start) < lo:
+        j += 1
+    best_j = None
+    best_gap = None
+    while j < n:
+        dur = segments[j]["start"] + segments[j]["duration"] - start
+        if dur > hi:
+            break
+        gap = abs(dur - target)
+        if best_gap is None or gap < best_gap:
+            best_gap = gap
+            best_j = j
+        j += 1
+    return best_j
+
+
+def _build_candidate(segments: List[Dict[str, Any]], i: int, j: int) -> Dict[str, Any]:
+    start = segments[i]["start"]
+    end = segments[j]["start"] + segments[j]["duration"]
+    return {
+        "start": round(start, 2),
+        "end": round(end, 2),
+        "duration": round(end - start, 2),
+        "text": " ".join(s["text"] for s in segments[i:j + 1]),
+        "first": segments[i]["text"].strip(),
+        "last": segments[j]["text"].strip(),
+    }
+
+
+def _make_candidates(segments: List[Dict[str, Any]], lo: float, hi: float, stride: float,
+                     prefer: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Fixed-target candidate windows (kept for compatibility)."""
     out: List[Dict[str, Any]] = []
-    seen = set()
-    for c in cands:
-        key = round(c["start"], 0)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(c)
-    for idx, c in enumerate(out, 1):
-        c["id"] = f"C{idx:02d}"
+    for i in _candidate_starts(segments, stride):
+        j = _window_end(segments, i, lo, hi, prefer if prefer else hi)
+        if j is not None:
+            out.append(_build_candidate(segments, i, j))
     return out
 
 
@@ -369,7 +387,7 @@ def _score_candidate(text: str, first: str, duration: float) -> Dict[str, int]:
     visual = min(visual, 5)
 
     length_bonus = 0
-    if 45 <= duration <= 65:
+    if 50 <= duration <= 89:
         length_bonus = 1
 
     total = hook + completeness + standalone + visual + length_bonus
@@ -385,30 +403,62 @@ def _score_candidate(text: str, first: str, duration: float) -> Dict[str, int]:
 
 def score_moments(
     segments: List[Dict[str, Any]],
-    min_duration: float = 45,
-    max_duration: float = 60,
+    min_duration: float = 50,
+    max_duration: float = 90,
     count: int = 6,
     stride: float = 60,
+    target_duration: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Generate candidates, score them, and return the top N non-overlapping."""
-    cands = _make_candidates(segments, min_duration, max_duration, stride)
-    for c in cands:
+    """Score candidates and return the top N non-overlapping.
+
+    Clip length varies with each moment's score inside [min_duration, max_duration]:
+    a stronger moment gets more room, a weaker one stays tighter. Pass a number for
+    target_duration to force one fixed length for every clip instead.
+    """
+    starts = _candidate_starts(segments, stride)
+    mid = (min_duration + max_duration) / 2.0
+    ref_target = target_duration if target_duration else mid
+
+    scored: List[Dict[str, Any]] = []
+    for i in starts:
+        j = _window_end(segments, i, min_duration, max_duration, ref_target)
+        if j is None:
+            continue
+        c = _build_candidate(segments, i, j)
+        c["_i"] = i
+        c["total"] = _score_candidate(c["text"], c["first"], c["duration"])["total"]
+        scored.append(c)
+
+    if target_duration is None and scored:
+        totals = [c["total"] for c in scored]
+        lo_s, hi_s = min(totals), max(totals)
+        span = max_duration - min_duration
+        rebuilt: List[Dict[str, Any]] = []
+        for c in scored:
+            frac = 0.5 if hi_s == lo_s else (c["total"] - lo_s) / (hi_s - lo_s)
+            target = min_duration + span * frac
+            j = _window_end(segments, c["_i"], min_duration, max_duration, target)
+            if j is None:
+                continue
+            nc = _build_candidate(segments, c["_i"], j)
+            nc["target"] = round(target, 1)
+            rebuilt.append(nc)
+        scored = rebuilt
+
+    for c in scored:
         c["scores"] = _score_candidate(c["text"], c["first"], c["duration"])
         c["total"] = c["scores"]["total"]
-    cands.sort(key=lambda x: x["total"], reverse=True)
+    scored.sort(key=lambda x: x["total"], reverse=True)
 
     picked: List[Dict[str, Any]] = []
-    for c in cands:
-        overlap = False
-        for p in picked:
-            if not (c["end"] <= p["start"] or c["start"] >= p["end"]):
-                overlap = True
-                break
-        if overlap:
+    for c in scored:
+        if any(not (c["end"] <= p["start"] or c["start"] >= p["end"]) for p in picked):
             continue
         picked.append(c)
         if len(picked) >= count:
             break
+    for idx, c in enumerate(picked, 1):
+        c["id"] = f"C{idx:02d}"
     return picked
 
 
@@ -479,8 +529,99 @@ def write_copy(
 
 
 # ---------------------------------------------------------------------------
-# Cutting
+# Cutting  (loudness-normalized, silence-trimmed, word-chunked captions,
+#           platform size cap)
 # ---------------------------------------------------------------------------
+
+LOUDNESS_TARGET = "loudnorm=I=-14:TP=-1.5:LRA=11"
+DEFAULT_MAX_MB = 90.0
+DEFAULT_WORDS_PER_CUE = 3
+DEFAULT_SUBS = True
+_SILENCE_RE = re.compile(r"silence_(start|end):\s*([0-9.]+)")
+
+
+def _truthy(v) -> bool:
+    """Interpret bools and '0/false/no/off/' strings as off."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _chunk_words(text: str, n: int) -> List[str]:
+    """Group words into chunks of n, for short-form captions."""
+    words = text.split()
+    if n <= 0 or len(words) <= n:
+        return [" ".join(words)] if words else []
+    return [" ".join(words[i:i + n]) for i in range(0, len(words), n)]
+
+
+def _detect_lead_tail_silence(ffmpeg: str, src: str, start: float, dur: float,
+                              noise_db: float = -40.0, min_sil: float = 0.30):
+    """Return (lead, tail) silence seconds at the segment's head and tail."""
+    cmd = [ffmpeg, "-hide_banner", "-nostats", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}",
+           "-i", src, "-af", f"silencedetect=noise={noise_db}dB:d={min_sil}",
+           "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    events = [(k, float(v)) for k, v in _SILENCE_RE.findall(r.stderr)]
+    intervals = []
+    cur = None
+    for k, v in events:
+        if k == "start":
+            cur = v
+        elif k == "end" and cur is not None:
+            intervals.append((cur, v))
+            cur = None
+    if cur is not None:  # silence ran to the end of the segment
+        intervals.append((cur, dur))
+    lead = tail = 0.0
+    for s, e in intervals:
+        if s <= 0.05:
+            lead = max(lead, e)
+        if e >= dur - 0.05:
+            tail = max(tail, dur - s)
+    return max(lead, 0.0), max(tail, 0.0)
+
+
+def _trim_silence(ffmpeg: str, src: str, start: float, end: float,
+                  max_trim: float = 5.0, min_keep: float = 15.0):
+    """Tighten a clip's head/tail onto speech; never over-trim."""
+    if end <= start:
+        return start, end
+    dur = end - start
+    try:
+        lead, tail = _detect_lead_tail_silence(ffmpeg, src, start, dur)
+    except Exception:
+        return start, end
+    lead = min(lead, max_trim)
+    tail = min(tail, max_trim)
+    ns, ne = start + lead, end - tail
+    if ne - ns < max(min_keep, 0.5 * dur):
+        return start, end
+    return round(ns, 3), round(ne, 3)
+
+
+def _enforce_size(ffmpeg: str, path: str, dur: float, max_mb: float) -> Optional[int]:
+    """Re-encode to fit max_mb when the clip overshoots; return final bytes."""
+    if not max_mb or max_mb <= 0 or not os.path.exists(path):
+        return os.path.getsize(path) if os.path.exists(path) else None
+    size = os.path.getsize(path)
+    if size <= max_mb * 1024 * 1024:
+        return size
+    audio_kbps = 128
+    target_bits = max_mb * 1024 * 1024 * 8 * 0.92
+    v_kbps = int(max(200, target_bits / max(dur, 1.0) / 1000 - audio_kbps))
+    tmp = path + ".cap.mp4"
+    cmd = [ffmpeg, "-y", "-i", path, "-c:v", "libx264", "-preset", "medium",
+           "-b:v", f"{v_kbps}k", "-maxrate", f"{int(v_kbps * 1.5)}k",
+           "-bufsize", f"{v_kbps * 3}k", "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+           "-movflags", "+faststart", tmp]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) < size:
+        os.replace(tmp, path)
+    elif os.path.exists(tmp):
+        os.remove(tmp)
+    return os.path.getsize(path)
+
 
 def _fmt_srt_time(s: float) -> str:
     h = int(s // 3600)
@@ -490,7 +631,10 @@ def _fmt_srt_time(s: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
 
-def _make_srt(segments: List[Dict[str, Any]], start: float, end: float, path: str) -> int:
+def _make_srt(segments: List[Dict[str, Any]], start: float, end: float, path: str,
+              words_per_cue: int = DEFAULT_WORDS_PER_CUE) -> int:
+    """Write an SRT for [start,end]. Each transcript cue is split into short
+    word groups (default 3) with proportional timing, the short-form look."""
     in_range = []
     for seg in segments:
         ss, ee = seg["start"], seg["start"] + seg["duration"]
@@ -504,14 +648,24 @@ def _make_srt(segments: List[Dict[str, Any]], start: float, end: float, path: st
             re = min(re, in_range[i + 1][0])
         re = min(re, end)
         rs = max(rs, start)
-        rel_s = rs - start
-        rel_e = re - start
-        if rel_e - rel_s < 0.3:
+        if re - rs < 0.2:
             continue
-        if rel_e - rel_s > 4.0:
-            rel_e = rel_s + 4.0
-        lines += [str(idx), f"{_fmt_srt_time(rel_s)} --> {_fmt_srt_time(rel_e)}", text.strip(), ""]
-        idx += 1
+        if re - rs > 4.5:
+            re = rs + 4.5
+        chunks = _chunk_words(text.strip(), words_per_cue)
+        if not chunks:
+            continue
+        weights = [max(len(c), 1) for c in chunks]
+        total = sum(weights)
+        t = rs
+        for chunk, w in zip(chunks, weights):
+            cs = t
+            ce = t + (re - rs) * (w / total)
+            t = ce
+            if ce - cs < 0.12:
+                continue
+            lines += [str(idx), f"{_fmt_srt_time(cs - start)} --> {_fmt_srt_time(ce - start)}", chunk, ""]
+            idx += 1
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return idx - 1
@@ -522,10 +676,16 @@ def cut_clips(
     clips: List[Dict[str, Any]],
     out_dir: Optional[str] = None,
     segments: Optional[List[Dict[str, Any]]] = None,
-    subs: bool = True,
+    subs: bool = DEFAULT_SUBS,
+    trim_silence: bool = True,
+    normalize_loudness: bool = True,
+    words_per_cue: int = DEFAULT_WORDS_PER_CUE,
+    max_size_mb: float = DEFAULT_MAX_MB,
 ) -> List[Dict[str, Any]]:
-    """Cut clips from a source video with ffmpeg, burning subtitles."""
+    """Cut clips from a source video with ffmpeg: word-chunked subtitles,
+    loudness normalization, optional head/tail silence trim, size cap."""
     ffmpeg = _ffmpeg()
+    video_path = os.path.abspath(video_path)
     out_dir = _resolve_out_dir(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     results: List[Dict[str, Any]] = []
@@ -536,18 +696,22 @@ def cut_clips(
             raise ValueError("orientation must be 'h' or 'v'")
         start = float(c["start"])
         end = float(c["end"])
+        raw_start, raw_end = start, end
+        if trim_silence:
+            start, end = _trim_silence(ffmpeg, video_path, start, end)
         dur = end - start
         srt = os.path.join(out_dir, f"{label}.srt")
         out = os.path.join(out_dir, f"{label}_{orient}.mp4")
+        do_subs = _truthy(c.get("subs", subs))
         n = 0
-        if subs and segments:
-            n = _make_srt(segments, start, end, srt)
+        if do_subs and segments:
+            n = _make_srt(segments, start, end, srt, words_per_cue)
         if orient == "v":
             base_vf = "crop=ih*9/16:ih,scale=1080:1920"
         else:
             base_vf = "scale=1920:1080"
         sub_arg = _escape_filter_path(os.path.basename(srt))
-        if subs and segments and os.path.exists(srt) and os.path.getsize(srt) > 0:
+        if do_subs and segments and os.path.exists(srt) and os.path.getsize(srt) > 0:
             if orient == "v":
                 vf = (
                     f"subtitles={sub_arg}:force_style='FontSize=20,"
@@ -564,17 +728,25 @@ def cut_clips(
             vf = base_vf
         cmd = [
             ffmpeg, "-y", "-ss", f"{start:.3f}", "-i", video_path, "-t", f"{dur:.3f}",
-            "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-vf", vf,
+        ]
+        if normalize_loudness:
+            cmd += ["-af", LOUDNESS_TARGET]
+        cmd += [
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out,
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=out_dir)
+        size = _enforce_size(ffmpeg, out, dur, max_size_mb) if r.returncode == 0 else None
         results.append({
             "label": label,
             "orientation": orient,
             "start": start,
             "end": end,
             "duration": round(dur, 2),
-            "subs": n if subs else 0,
+            "silence_trimmed": round((start - raw_start) + (raw_end - end), 2) if trim_silence else 0.0,
+            "subs": n if do_subs else 0,
+            "size_mb": round(size / (1024 * 1024), 2) if size else None,
             "output": out if r.returncode == 0 else None,
             "error": r.stderr[-400:] if r.returncode != 0 else None,
         })
@@ -590,8 +762,9 @@ def run(
     count: int = 6,
     platforms: Optional[List[str]] = None,
     out_dir: Optional[str] = None,
-    min_duration: float = 45,
-    max_duration: float = 60,
+    min_duration: float = 50,
+    max_duration: float = 90,
+    target_duration: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Full pipeline: fetch transcript, score moments, write copy.
 
@@ -601,7 +774,7 @@ def run(
     t0 = time.time()
     transcript = fetch_transcript(url, out_dir=out_dir)
     segments = transcript["segments"]
-    clips = score_moments(segments, min_duration, max_duration, count)
+    clips = score_moments(segments, min_duration, max_duration, count, 60, target_duration)
     copy: Dict[str, Any] = {}
     for c in clips:
         c["copy"] = write_copy(c["text"], platforms, url=url, title=transcript.get("title", ""))

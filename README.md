@@ -1,14 +1,14 @@
 # Content Engine for Hermes Agent
 
-One long video in, a week of content out. Paste a YouTube URL, get scored 45 to 60 second clips and per-platform social copy. Live in 90 seconds, no editing software.
+One long video in, a week of content out. Paste a YouTube URL, get scored 50 to 90 second clips and per-platform social copy. Live in 90 seconds, no editing software.
 
 ## What it does
 
 Five tools in the `content-engine` toolset:
 
 - `ce_fetch_transcript` — fetch the timestamped transcript and metadata for a YouTube video.
-- `ce_score_moments` — score transcript segments and return the top non-overlapping 45 to 60 second clip candidates.
-- `ce_write_copy` — write a first draft of per-platform social copy from a clip transcript.
+- `ce_score_moments` — score transcript segments and return the top non-overlapping 50 to 90 second clip candidates. Clip length varies with each moment's score.
+- `ce_write_copy` — write a first draft of per-platform social copy from a clip transcript, after the clip is published. Pass the live URL; with none it leaves the link out instead of inventing one.
 - `ce_cut_clips` — cut clips from a downloaded video with ffmpeg, burning in subtitles.
 - `ce_run` — the whole pipeline in one call. Fetch, score, and draft copy.
 
@@ -67,8 +67,9 @@ Then call `ce_cut_clips` with the source path, the clip list, and the transcript
 
 1. **Fetch** — yt-dlp downloads the English captions (manual or auto-generated) and writes a VTT file. The plugin parses the VTT into timestamped segments.
 2. **Score** — the plugin builds segment-aligned candidate windows, scores each on hook, completeness, standalone value, and visual payoff, then picks the top non-overlapping windows.
-3. **Copy** — the plugin extracts the hook and the key fact from each clip and writes a first draft per platform. X and Facebook get the link. Shorts and TikTok get "Link in bio."
-4. **Cut** — ffmpeg cuts each window, burns the subtitles, and writes horizontal and vertical mp4s.
+3. **Cut** — ffmpeg cuts each window, burns the subtitles, and writes horizontal and vertical mp4s.
+4. **Publish** — you post the clip and get its real public URL. This step is yours; the plugin does not post anywhere.
+5. **Copy** — write the per-platform draft LAST, after the clip is published, passing the live URL. Copy never invents a link: if you do not pass the published URL, the draft leaves the link out. X and Facebook get the real link. Shorts and TikTok get "Link in bio."
 
 ## Security notes
 

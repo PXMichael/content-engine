@@ -1,11 +1,11 @@
 name: content-engine
 label: Content Engine
 kind: standalone
-version: "0.1.0"
+version: "0.3.0"
 author: PXMichael
 homepage: https://github.com/PXMichael/content-engine
 license: MIT
-description: "One long video in, a week of content out. Paste a YouTube URL, get scored 45 to 60 second clips and per-platform social copy. Live in 90 seconds, no editing software."
+description: "One long video in, a week of content out. Paste a YouTube URL, get scored 50 to 90 second clips and per-platform social copy. Live in 90 seconds, no editing software."
 requires_hermes: ">=0.19"
 platforms: []
 provides_tools:

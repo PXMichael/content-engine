@@ -80,8 +80,9 @@ def _handle_score_moments(args: dict, **kw) -> str:
         segments = _load_segments(args)
         clips = engine.score_moments(
             segments,
-            min_duration=float(args.get("min_duration", 45)),
-            max_duration=float(args.get("max_duration", 60)),
+            min_duration=float(args.get("min_duration", 50)),
+            max_duration=float(args.get("max_duration", 90)),
+            target_duration=(float(args["target_duration"]) if args.get("target_duration") else None),
             count=int(args.get("count", 6)),
             stride=float(args.get("stride", 60)),
         )
@@ -153,8 +154,9 @@ def _handle_run(args: dict, **kw) -> str:
             count=int(args.get("count", 6)),
             platforms=platforms,
             out_dir=args.get("out_dir") or None,
-            min_duration=float(args.get("min_duration", 45)),
-            max_duration=float(args.get("max_duration", 60)),
+            min_duration=float(args.get("min_duration", 50)),
+            max_duration=float(args.get("max_duration", 90)),
+            target_duration=(float(args["target_duration"]) if args.get("target_duration") else None),
         )
     return _dispatch(run, "ce_run", "Failed to run the pipeline")
 
@@ -182,8 +184,9 @@ SCORE_MOMENTS_SCHEMA = {
         "properties": {
             "transcript_path": {"type": "string", "description": "Path to transcript.json from ce_fetch_transcript."},
             "segments": {"type": "array", "description": "Inline transcript segments, instead of a path."},
-            "min_duration": {"type": "number", "description": "Minimum clip length in seconds. Default 45."},
-            "max_duration": {"type": "number", "description": "Maximum clip length in seconds. Default 60."},
+            "min_duration": {"type": "number", "description": "Minimum clip length in seconds. Default 50."},
+            "max_duration": {"type": "number", "description": "Maximum clip length in seconds. Default 90."},
+            "target_duration": {"type": "number", "description": "Force one fixed clip length. Omit to vary length with each moment's score inside [min,max]."},
             "count": {"type": "integer", "description": "How many clips to return. Default 6."},
             "stride": {"type": "number", "description": "Candidate spacing in seconds. Default 60."},
         },
@@ -193,13 +196,13 @@ SCORE_MOMENTS_SCHEMA = {
 
 WRITE_COPY_SCHEMA = {
     "name": "ce_write_copy",
-    "description": "Write a first draft of per-platform social copy from a clip transcript.",
+    "description": "Write a first draft of per-platform social copy from a clip transcript. Run this AFTER the clip is published and pass the live URL; with no URL the draft leaves the link out.",
     "parameters": {
         "type": "object",
         "properties": {
             "clip_text": {"type": "string", "description": "The clip transcript text."},
             "platforms": {"type": "array", "items": {"type": "string"}, "description": "x, facebook, shorts, tiktok, instagram. Default all four."},
-            "url": {"type": "string", "description": "Link to include where the platform allows it."},
+            "url": {"type": "string", "description": "The PUBLISHED clip URL, where the platform allows a link. Omit if the clip is not published yet; the draft then leaves the link out rather than inventing one."},
             "title": {"type": "string", "description": "Optional video title."},
         },
         "required": ["clip_text"],
@@ -224,7 +227,7 @@ CUT_CLIPS_SCHEMA = {
 
 RUN_SCHEMA = {
     "name": "ce_run",
-    "description": "Run the full Content Engine pipeline on a YouTube URL: fetch transcript, score moments, and draft per-platform copy.",
+    "description": "Run the full Content Engine pipeline on a YouTube URL: fetch transcript, score moments, and produce a first-draft copy scaffold. This scaffold is not final: run ce_write_copy again with the PUBLISHED clip URL after the clip goes live.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -232,8 +235,9 @@ RUN_SCHEMA = {
             "count": {"type": "integer", "description": "How many clips to return. Default 6."},
             "platforms": {"type": "array", "items": {"type": "string"}, "description": "x, facebook, shorts, tiktok, instagram. Default all four."},
             "out_dir": {"type": "string", "description": "Optional working directory."},
-            "min_duration": {"type": "number", "description": "Minimum clip length in seconds. Default 45."},
-            "max_duration": {"type": "number", "description": "Maximum clip length in seconds. Default 60."},
+            "min_duration": {"type": "number", "description": "Minimum clip length in seconds. Default 50."},
+            "max_duration": {"type": "number", "description": "Maximum clip length in seconds. Default 90."},
+            "target_duration": {"type": "number", "description": "Force one fixed clip length. Omit to vary length with each moment's score inside [min,max]."},
         },
         "required": ["url"],
     },
