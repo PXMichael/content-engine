@@ -552,7 +552,36 @@ def _chunk_words(text: str, n: int) -> List[str]:
     words = text.split()
     if n <= 0 or len(words) <= n:
         return [" ".join(words)] if words else []
-    return [" ".join(words[i:i + n]) for i in range(0, len(words), n)]
+    return [f" ".join(words[i:i + n]) for i in range(0, len(words), n)]
+
+
+_FILLER_PHRASES = re.compile(
+    r"\b(i mean|you know|y'know|ya know|kind of|kinda|sort of|sorta)\b",
+    re.IGNORECASE,
+)
+_FILLER_WORDS = {
+    "uh", "um", "uhh", "umm", "eh", "ah", "like", "well", "okay", "ok",
+    "alright", "right", "sure", "actually", "basically", "literally",
+    "i guess", "i think", "y'know", "oh",
+}
+
+
+def _strip_fillers(text: str) -> str:
+    """Drop filler words from transcript text before chunking captions.
+
+    Keeps captions clean so viewers are not distracted by 'uh/um/like'
+    but preserves every real word the speaker said.
+    """
+    if not text:
+        return text
+    text = _FILLER_PHRASES.sub(" ", text)
+    keep = []
+    for tok in text.split():
+        low = tok.lower().strip(".,!?;:")
+        if low in _FILLER_WORDS:
+            continue
+        keep.append(tok)
+    return " ".join(keep)
 
 
 def _detect_lead_tail_silence(ffmpeg: str, src: str, start: float, dur: float,
@@ -644,6 +673,7 @@ def _make_srt(segments: List[Dict[str, Any]], start: float, end: float, path: st
     idx = 1
     lines: List[str] = []
     for i, (rs, re, text) in enumerate(in_range):
+        text = _strip_fillers(text)
         if i + 1 < len(in_range):
             re = min(re, in_range[i + 1][0])
         re = min(re, end)
