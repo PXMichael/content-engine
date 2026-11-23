@@ -144,3 +144,24 @@ def test_no_hardcoded_personal_paths():
     src = (PLUGIN_DIR / "engine.py").read_text(encoding="utf-8")
     assert "C:/Users/" not in src
     assert "shutil.which" in src
+
+
+def test_strip_fillers_removes_tics_but_keeps_real_words():
+    eng = _load_engine()
+    # Vocal tics and safe phrases go.
+    assert eng._strip_fillers("uh, so i mean, you know, the craft was there") == "so the craft was there"
+    # Meaning-bearing words survive: 'like' is a comparison, 'right' is a direction.
+    out = eng._strip_fillers("an art like this, turn right, we are well past that")
+    assert "like" in out and "right" in out and "well" in out
+    # Empty input is safe.
+    assert eng._strip_fillers("") == ""
+
+
+def test_chunk_words_groups_and_handles_edges():
+    eng = _load_engine()
+    words = "one two three four five".split()
+    assert eng._chunk_words(" ".join(words), 2) == ["one two", "three four", "five"]
+    assert eng._chunk_words("", 3) == []
+    assert eng._chunk_words("short", 10) == ["short"]
+    # n <= 0 falls back to one chunk, never a crash.
+    assert eng._chunk_words("a b c", 0) == ["a b c"]

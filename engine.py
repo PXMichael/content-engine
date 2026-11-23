@@ -552,7 +552,7 @@ def _chunk_words(text: str, n: int) -> List[str]:
     words = text.split()
     if n <= 0 or len(words) <= n:
         return [" ".join(words)] if words else []
-    return [f" ".join(words[i:i + n]) for i in range(0, len(words), n)]
+    return [" ".join(words[i:i + n]) for i in range(0, len(words), n)]
 
 
 _FILLER_PHRASES = re.compile(
@@ -560,17 +560,21 @@ _FILLER_PHRASES = re.compile(
     re.IGNORECASE,
 )
 _FILLER_WORDS = {
-    "uh", "um", "uhh", "umm", "eh", "ah", "like", "well", "okay", "ok",
-    "alright", "right", "sure", "actually", "basically", "literally",
-    "i guess", "i think", "y'know", "oh",
+    # Single tokens that are virtually always vocal tics, never information.
+    "uh", "um", "uhh", "umm", "eh", "ah", "hmm", "y'know",
+    # Markers. 'right/well/sure/actually/like' stay OUT: they often carry
+    # meaning ("go right", "an art like this"), so stripping them would
+    # corrupt the caption. The phrase-level pass above handles the safe ones.
 }
 
 
 def _strip_fillers(text: str) -> str:
-    """Drop filler words from transcript text before chunking captions.
+    """Drop filler phrases and vocal tics from transcript text.
 
-    Keeps captions clean so viewers are not distracted by 'uh/um/like'
-    but preserves every real word the speaker said.
+    Removes only the safe subset: multi-word fillers ("i mean", "you know",
+    "kind of") handled by the phrase pass, and single-token tics ("uh", "um")
+    that never carry meaning. Meaning-bearing words ("like", "right", "well")
+    are left untouched so captions stay accurate.
     """
     if not text:
         return text
@@ -578,6 +582,8 @@ def _strip_fillers(text: str) -> str:
     keep = []
     for tok in text.split():
         low = tok.lower().strip(".,!?;:")
+        if not low:  # punctuation left behind where a phrase was removed
+            continue
         if low in _FILLER_WORDS:
             continue
         keep.append(tok)
